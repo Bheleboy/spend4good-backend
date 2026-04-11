@@ -230,37 +230,84 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 app.post('/api/whatsapp/webhook', async (req, res) => {
   try {
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body;
-    
-    // Extract phone number (remove 'whatsapp:' prefix)
+
     const phoneNumber = From.replace('whatsapp:', '');
-    
-    // Get user
-    const user = await getUserByPhone(phoneNumber);
-    
+    const message = Body?.trim() || '';
+
+    // Get user (including inactive/pending users)
+    const { data: user } = await supabase
+      .from('users')
+      .select('*, organizations(*)')
+      .eq('phone_number', phoneNumber)
+      .single();
+
+    // ── ONBOARDING FLOW for invited (not yet active) users ──
+    if (user && !user.is_active) {
+
+      // Step 1: User is awaiting OTP verification
+      if (user.setup_step === 'awaiting_otp') {
+        const code = message.trim();
+        const { data: otpData } = await supabase
+          .from('otp_codes')
+          .select('*')
+          .eq('phone_number', phoneNumber)
+          .eq('code', code)
+          .is('verified_at', null)
+          .gt('expires_at', new Date().toISOString())
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+
+        if (!otpData) {
+          await sendWhatsAppMessage(phoneNumber,
+            `That code doesn't look right. Please check and try again, or ask your admin to resend your invite.`
+          );
+        } else {
+          await supabase.from('otp_codes').update({ verified_at: new Date().toISOString() }).eq('id', otpData.id);
+          await supabase.from('users').update({ setup_step: 'awaiting_name' }).eq('id', user.id);
+          await sendWhatsAppMessage(phoneNumber,
+            `✅ Perfect, your number is verified!\n\nWhat's your full name?`
+          );
+        }
+        return res.status(200).send('OK');
+      }
+
+      // Step 2: User has verified OTP, waiting for their name
+      if (user.setup_step === 'awaiting_name') {
+        const fullName = message.trim();
+        if (fullName.length < 2) {
+          await sendWhatsAppMessage(phoneNumber, `Please reply with your full name to complete setup.`);
+        } else {
+          await supabase.from('users').update({
+            full_name: fullName,
+            is_active: true,
+            setup_step: null,
+            otp_verified_at: new Date().toISOString()
+          }).eq('id', user.id);
+
+          await sendWhatsAppMessage(phoneNumber,
+            `🎉 Welcome to Spend4Good, ${fullName}!\n\nYou're all set as a *${user.role.replace('_', ' ')}* at *${user.organizations?.name}*.\n\nType *help* to see what you can do.`
+          );
+        }
+        return res.status(200).send('OK');
+      }
+    }
+
+    // ── UNREGISTERED user ──
     if (!user) {
-      await sendWhatsAppMessage(phoneNumber, 
-        '❌ You are not registered. Please contact your organization admin or sign up at spend4good.com'
+      await sendWhatsAppMessage(phoneNumber,
+        `Hi! You're not registered on Spend4Good yet.\n\nAsk your organisation admin to invite you — they'll send a link to this number.`
       );
       return res.status(200).send('OK');
     }
-    
-    // Update user context for RLS
-    await supabase.rpc('set_config', {
-      setting_name: 'app.current_user_phone',
-      setting_value: phoneNumber
-    });
-    
-    const message = Body?.trim().toLowerCase() || '';
-    
-    // Handle image uploads
+
+    // ── ACTIVE user — normal flow ──
     if (MediaUrl0 && MediaContentType0?.startsWith('image/')) {
-      await handleImageUpload(user, MediaUrl0, message);
+      await handleImageUpload(user, MediaUrl0, message.toLowerCase());
       return res.status(200).send('OK');
     }
-    
-    // Parse text commands
-    await parseCommand(user, message, phoneNumber);
-    
+
+    await parseCommand(user, message.toLowerCase(), phoneNumber);
     res.status(200).send('OK');
   } catch (error) {
     console.error('WhatsApp webhook error:', error);
@@ -359,6 +406,76 @@ async function handleImageUpload(user, mediaUrl, caption) {
 async function parseCommand(user, message, phoneNumber) {
   let response = '';
   const msg = message.toLowerCase().trim();
+
+  // ── ADD USER (admin only) ──
+  // Accepts: "add +27831234567 as field agent", "invite +27831234567 accountant"
+  if (msg.includes('add ') || msg.includes('invite ')) {
+    if (!hasPermission(user.role, 'add_users')) {
+      response = `Sorry, only admins can invite new users.`;
+      await sendWhatsAppMessage(phoneNumber, response);
+      return;
+    }
+
+    const phoneMatch = message.match(/(\+?\d[\d\s\-]{8,14}\d)/);
+    const invitePhone = phoneMatch ? phoneMatch[1].replace(/\s|-/g, '') : null;
+
+    const roleMap = {
+      'field agent': 'field_agent', 'fieldagent': 'field_agent',
+      'project manager': 'project_manager', 'projectmanager': 'project_manager', 'pm': 'project_manager',
+      'accountant': 'accountant',
+      'funder': 'funder',
+      'admin': 'admin'
+    };
+    let assignedRole = 'field_agent';
+    for (const [keyword, roleValue] of Object.entries(roleMap)) {
+      if (msg.includes(keyword)) { assignedRole = roleValue; break; }
+    }
+
+    if (!invitePhone) {
+      response = `Please include the person's phone number.\n\nExample:\n*add +27831234567 as field agent*\n\nRoles: field agent, project manager, accountant, funder, admin`;
+      await sendWhatsAppMessage(phoneNumber, response);
+      return;
+    }
+
+    // Check if already exists
+    const { data: existing } = await supabase.from('users').select('id, is_active').eq('phone_number', invitePhone).single();
+    if (existing?.is_active) {
+      response = `${invitePhone} is already registered on Spend4Good.`;
+      await sendWhatsAppMessage(phoneNumber, response);
+      return;
+    }
+
+    // Generate OTP
+    const code = generateOTP();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours for invite
+
+    if (existing && !existing.is_active) {
+      // Re-invite: update role and resend OTP
+      await supabase.from('users').update({ role: assignedRole, setup_step: 'awaiting_otp' }).eq('id', existing.id);
+    } else {
+      // New invite
+      await supabase.from('users').insert({
+        phone_number: invitePhone,
+        full_name: 'Pending',
+        role: assignedRole,
+        org_id: user.org_id,
+        is_active: false,
+        setup_step: 'awaiting_otp'
+      });
+    }
+
+    await supabase.from('otp_codes').insert({ phone_number: invitePhone, code, expires_at: expiresAt.toISOString() });
+
+    // Send OTP to new user via WhatsApp
+    await sendWhatsAppMessage(invitePhone,
+      `👋 Hi! You've been invited to join *${user.organizations?.name}* on Spend4Good by ${user.full_name}.\n\nYour role will be: *${assignedRole.replace('_', ' ')}*\n\nYour verification code is:\n\n*${code}*\n\nReply to this message with that code to activate your account.`
+    );
+
+    const roleLabel = assignedRole.replace('_', ' ');
+    response = `✅ Invite sent to ${invitePhone} as *${roleLabel}*.\n\nThey'll receive a WhatsApp message with a verification code. Once they confirm, they're in!`;
+    await sendWhatsAppMessage(phoneNumber, response);
+    return;
+  }
 
   // Greetings
   if (/^(hi|hello|hey|howzit|sawubona|hola|good\s?(morning|afternoon|evening))/.test(msg)) {
@@ -516,8 +633,9 @@ function getHelpText(role) {
 
   const commands = {
     admin: [
-      `📋 *See pending approvals* — type "pending" or "what needs approval"`,
-      `✅ *Approve a receipt* — type "approve 1" (after seeing the pending list)`,
+      `👤 *Invite someone* — type "add +27831234567 as field agent"`,
+      `📋 *See pending approvals* — type "pending"`,
+      `✅ *Approve a receipt* — type "approve 1"`,
       `❌ *Reject a receipt* — type "reject 1 reason here"`,
       `📁 *See projects* — type "projects"`,
       `➕ *Start a new project* — type "new project Well Drilling"`,
