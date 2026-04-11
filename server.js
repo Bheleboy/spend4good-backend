@@ -9,10 +9,22 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Supabase
+// Initialize Supabase with service role (bypasses RLS)
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    },
+    db: {
+      schema: 'public'
+    },
+    global: {
+      headers: { 'x-supabase-bypass-rls': 'true' }
+    }
+  }
 );
 
 // Initialize Twilio
@@ -79,8 +91,11 @@ async function getUserByPhone(phoneNumber) {
     .select('*, organizations(*)')
     .eq('phone_number', phoneNumber)
     .single();
-  
-  if (error) return null;
+
+  if (error) {
+    console.error('getUserByPhone error:', error.message, '| phone:', phoneNumber);
+    return null;
+  }
   return data;
 }
 
@@ -562,6 +577,28 @@ app.get('/api/documents', async (req, res) => {
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Debug endpoint - checks env vars and Supabase connection
+app.get('/debug', async (req, res) => {
+  const envCheck = {
+    SUPABASE_URL: !!process.env.SUPABASE_URL,
+    SUPABASE_SERVICE_ROLE_KEY_length: process.env.SUPABASE_SERVICE_ROLE_KEY?.length || 0,
+    SUPABASE_ANON_KEY_length: process.env.SUPABASE_ANON_KEY?.length || 0,
+    TWILIO_ACCOUNT_SID: !!process.env.TWILIO_ACCOUNT_SID,
+    TWILIO_PHONE_NUMBER: process.env.TWILIO_PHONE_NUMBER,
+    TWILIO_WHATSAPP_NUMBER: process.env.TWILIO_WHATSAPP_NUMBER,
+  };
+
+  let dbTest = null;
+  try {
+    const { data, error } = await supabase.from('users').select('count').limit(1);
+    dbTest = error ? { error: error.message } : { ok: true };
+  } catch (e) {
+    dbTest = { error: e.message };
+  }
+
+  res.json({ env: envCheck, db: dbTest });
 });
 
 // Start server
