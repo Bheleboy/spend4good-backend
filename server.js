@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 // Trim keys to remove any accidental newlines/spaces from env var paste
 const supabase = createClient(
   process.env.SUPABASE_URL?.trim(),
-  process.env.SUPABASE_SERVICE_ROLE_KEY?.trim(),
+  process.env.SUPABASE_SERVICE_ROLE_KEY?.replace(/\s/g, ''),
   {
     auth: {
       autoRefreshToken: false,
