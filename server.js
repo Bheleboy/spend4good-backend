@@ -282,12 +282,14 @@ async function handleImageUpload(user, mediaUrl, caption) {
       return;
     }
     
-    // Simple parsing (will enhance with NLP later)
-    const projectMatch = caption.match(/for (.+?),/i);
-    const amountMatch = caption.match(/[R$€£]\s?(\d+(?:,\d{3})*(?:\.\d{2})?)/i);
-    
-    const projectName = projectMatch ? projectMatch[1].trim() : 'Unknown';
-    const amount = amountMatch ? parseFloat(amountMatch[1].replace(/,/g, '')) : 0;
+    // Flexible natural language parsing
+    // Handles: "Petrol R350 Well Drilling", "Receipt for drilling, R2500", "R200 transport"
+    const amountMatch = caption.match(/R\s?(\d+(?:[.,]\d{1,2})?)/i);
+    const amount = amountMatch ? parseFloat(amountMatch[1].replace(',', '.')) : 0;
+
+    // Try to find project name from caption (after "for" keyword, or just guess from words)
+    const forMatch = caption.match(/for\s+(.+?)(?:,|R|\d|$)/i);
+    const projectName = forMatch ? forMatch[1].trim() : '';
     
     // Find project by name
     const { data: projects } = await supabase
@@ -298,19 +300,15 @@ async function handleImageUpload(user, mediaUrl, caption) {
       .limit(1);
     
     if (!projects || projects.length === 0) {
-      response = `❌ Project "${projectName}" not found. Available projects:\n`;
-      
       const { data: allProjects } = await supabase
         .from('projects')
         .select('name')
         .eq('org_id', user.org_id)
         .eq('status', 'active');
-      
-      allProjects?.forEach(p => {
-        response += `- ${p.name}\n`;
-      });
-      
-      response += `\nPlease try again with correct project name.`;
+
+      response = `I couldn't match this to a project${projectName ? ` called "${projectName}"` : ''}.\n\nYour active projects are:\n\n`;
+      allProjects?.forEach((p, i) => { response += `${i + 1}. ${p.name}\n`; });
+      response += `\nSend the photo again and mention the project name in your caption.`;
       await sendWhatsAppMessage(user.phone_number, response);
       return;
     }
@@ -339,14 +337,13 @@ async function handleImageUpload(user, mediaUrl, caption) {
     
     if (error) {
       console.error('Error creating document:', error);
-      response = `❌ Failed to upload document. Please try again.`;
+      response = `Something went wrong saving that receipt. Please try sending it again.`;
     } else {
-      response = `✅ Document uploaded successfully!\n\n`;
+      response = `✅ Got it! Your receipt has been saved.\n\n`;
       response += `📁 Project: ${project.name}\n`;
       response += `💰 Amount: R${amount.toFixed(2)}\n`;
-      response += `📋 Document ID: ${doc.id}\n`;
-      response += `⏳ Status: Pending approval\n\n`;
-      response += `Your project manager will review this shortly.`;
+      response += `⏳ Waiting for approval\n\n`;
+      response += `Your project manager will review it shortly and you'll hear back here.`;
     }
     
     await sendWhatsAppMessage(user.phone_number, response);
@@ -358,129 +355,199 @@ async function handleImageUpload(user, mediaUrl, caption) {
   }
 }
 
-// Parse text commands
+// Parse text commands - conversational natural language
 async function parseCommand(user, message, phoneNumber) {
   let response = '';
-  
-  // Help command
-  if (message.includes('help')) {
+  const msg = message.toLowerCase().trim();
+
+  // Greetings
+  if (/^(hi|hello|hey|howzit|sawubona|hola|good\s?(morning|afternoon|evening))/.test(msg)) {
+    response = `👋 Hi ${user.full_name}! Welcome to Spend4Good.\n\nWhat would you like to do?\n\n1️⃣ See what needs approval\n2️⃣ Start a new project\n3️⃣ See all projects\n\nJust reply with a number or tell me what you need.`;
+  }
+
+  // Help
+  else if (msg.includes('help') || msg.includes('what can you do') || msg.includes('commands')) {
     response = getHelpText(user.role);
   }
-  
-  // Create project command
-  else if (message.startsWith('create project:')) {
-    if (!hasPermission(user.role, 'create_project')) {
-      response = `❌ You don't have permission to create projects.`;
-    } else {
-      const projectName = message.replace('create project:', '').trim();
-      
-      const { data, error } = await supabase
-        .from('projects')
-        .insert({
-          org_id: user.org_id,
-          name: projectName,
-          created_by: user.id,
-          status: 'active'
-        })
-        .select()
-        .single();
-      
-      if (error) {
-        response = `❌ Failed to create project: ${error.message}`;
-      } else {
-        response = `✅ Project "${projectName}" created successfully!\n📋 ID: ${data.id}`;
-      }
-    }
-  }
-  
-  // Status command
-  else if (message.includes('status')) {
+
+  // User replies with just "1", "2", "3" after greeting
+  else if (msg === '1' || msg.includes('what needs approval') || msg.includes('pending') || msg.includes('waiting') || msg.includes('status') || msg.includes('review')) {
     const { data: pending } = await supabase
       .from('documents')
-      .select('id, file_name, amount, project_id')
+      .select('id, description, amount, vendor_name, projects(name), users!documents_uploaded_by_fkey(full_name)')
       .eq('org_id', user.org_id)
       .eq('status', 'pending');
-    
-    if (user.role === 'field_agent') {
-      const myDocs = pending?.filter(d => d.uploaded_by === user.id) || [];
-      response = `📊 Your Status:\n\n`;
-      response += `⏳ Pending Approvals: ${myDocs.length}\n`;
+
+    if (!pending || pending.length === 0) {
+      response = `✅ All clear! There's nothing waiting for approval right now.`;
+    } else if (user.role === 'field_agent') {
+      response = `📋 Here are your receipts waiting for approval:\n\n`;
+      pending.forEach((doc, i) => {
+        response += `${i + 1}. ${doc.description || doc.vendor_name || 'Receipt'} — R${doc.amount?.toFixed(2) || '0.00'}\n   Project: ${doc.projects?.name || 'Unknown'}\n\n`;
+      });
     } else {
-      response = `📊 Organization Status:\n\n`;
-      response += `⏳ Pending Approvals: ${pending?.length || 0}\n`;
+      response = `📋 ${pending.length} receipt${pending.length > 1 ? 's' : ''} waiting for your approval:\n\n`;
+      pending.forEach((doc, i) => {
+        response += `${i + 1}. ${doc.description || doc.vendor_name || 'Receipt'} — R${doc.amount?.toFixed(2) || '0.00'}\n   From: ${doc.users?.full_name || 'Unknown'} | Project: ${doc.projects?.name || 'Unknown'}\n\n`;
+      });
+      response += `To approve, reply: *approve 1* (or whichever number)\nTo reject, reply: *reject 1 reason here*`;
     }
   }
-  
-  // Approve document command
-  else if (message.startsWith('approve doc #')) {
+
+  // Approve by number or keyword
+  else if (msg.startsWith('approve') || msg.startsWith('yes') || msg.startsWith('ok approve')) {
     if (!hasPermission(user.role, 'approve_doc')) {
-      response = `❌ You don't have permission to approve documents.`;
+      response = `Sorry, you don't have permission to approve documents. Only admins and project managers can do that.`;
     } else {
-      const docId = message.replace('approve doc #', '').trim();
-      
-      const { error } = await supabase
+      const numMatch = msg.match(/\d+/);
+      const num = numMatch ? parseInt(numMatch[0]) : null;
+
+      const { data: pending } = await supabase
         .from('documents')
-        .update({
-          status: 'approved',
-          approved_by: user.id,
-          approved_at: new Date().toISOString()
-        })
-        .eq('id', docId)
-        .eq('org_id', user.org_id);
-      
-      if (error) {
-        response = `❌ Failed to approve document.`;
+        .select('id, description, amount, vendor_name')
+        .eq('org_id', user.org_id)
+        .eq('status', 'pending');
+
+      if (!pending || pending.length === 0) {
+        response = `There's nothing waiting for approval right now. ✅`;
+      } else if (!num || num < 1 || num > pending.length) {
+        response = `Which one would you like to approve? Reply with a number between 1 and ${pending.length}.\n\nType *pending* to see the list again.`;
       } else {
-        response = `✅ Document #${docId} approved!`;
+        const doc = pending[num - 1];
+        await supabase
+          .from('documents')
+          .update({ status: 'approved', approved_by: user.id, approved_at: new Date().toISOString() })
+          .eq('id', doc.id);
+        response = `✅ Done! "${doc.description || doc.vendor_name}" (R${doc.amount?.toFixed(2)}) has been approved.`;
       }
     }
   }
-  
-  // Default response
-  else {
-    response = `👋 Hi ${user.full_name}!\n\nI didn't understand that command. Type "help" to see available commands.`;
+
+  // Reject by number
+  else if (msg.startsWith('reject') || msg.startsWith('decline') || msg.startsWith('no to')) {
+    if (!hasPermission(user.role, 'approve_doc')) {
+      response = `Sorry, you don't have permission to reject documents.`;
+    } else {
+      const numMatch = msg.match(/\d+/);
+      const num = numMatch ? parseInt(numMatch[0]) : null;
+      const reasonMatch = msg.match(/\d+\s+(.*)/);
+      const reason = reasonMatch ? reasonMatch[1].trim() : 'No reason given';
+
+      const { data: pending } = await supabase
+        .from('documents')
+        .select('id, description, amount, vendor_name')
+        .eq('org_id', user.org_id)
+        .eq('status', 'pending');
+
+      if (!pending || pending.length === 0) {
+        response = `There's nothing waiting for approval right now. ✅`;
+      } else if (!num || num < 1 || num > pending.length) {
+        response = `Which one would you like to reject? Reply with: *reject 1 reason here*\n\nType *pending* to see the list again.`;
+      } else {
+        const doc = pending[num - 1];
+        await supabase
+          .from('documents')
+          .update({ status: 'rejected', rejection_reason: reason })
+          .eq('id', doc.id);
+        response = `❌ "${doc.description || doc.vendor_name}" has been rejected.\nReason: ${reason}`;
+      }
+    }
   }
-  
+
+  // Create project
+  else if (msg === '2' || msg.includes('new project') || msg.includes('create project') || msg.includes('start a project') || msg.includes('add a project')) {
+    if (!hasPermission(user.role, 'create_project')) {
+      response = `Sorry, only admins and project managers can create projects. Ask your admin to set one up.`;
+    } else {
+      // Extract project name after keywords
+      let projectName = msg
+        .replace(/new project|create project|start a project|add a project/gi, '')
+        .replace(/called|named/gi, '')
+        .trim();
+
+      if (!projectName || projectName.length < 2) {
+        response = `Sure! What would you like to call the project?\n\nJust reply with the project name, e.g:\n*New project: Well Drilling Phase 2*`;
+      } else {
+        const { data, error } = await supabase
+          .from('projects')
+          .insert({ org_id: user.org_id, name: projectName, created_by: user.id, status: 'active' })
+          .select().single();
+
+        if (error) {
+          response = `Something went wrong creating the project. Please try again.`;
+        } else {
+          response = `✅ Project "${data.name}" is live and ready to use!\n\nYour team can now upload receipts and invoices for this project.`;
+        }
+      }
+    }
+  }
+
+  // List projects
+  else if (msg === '3' || msg.includes('show projects') || msg.includes('list projects') || msg.includes('our projects') || msg.includes('all projects') || msg.includes('projects')) {
+    const { data: projects } = await supabase
+      .from('projects')
+      .select('name, budget_amount, currency, status')
+      .eq('org_id', user.org_id)
+      .eq('status', 'active');
+
+    if (!projects || projects.length === 0) {
+      response = `No active projects yet. To start one, say *new project* followed by the name.`;
+    } else {
+      response = `📁 Your active projects:\n\n`;
+      projects.forEach((p, i) => {
+        response += `${i + 1}. ${p.name}`;
+        if (p.budget_amount) response += ` — Budget: R${p.budget_amount.toLocaleString()}`;
+        response += `\n`;
+      });
+    }
+  }
+
+  // Default
+  else {
+    response = `Hi ${user.full_name}! I didn't quite catch that. 😊\n\nHere's what I can help with:\n\n• Type *pending* to see what needs approval\n• Type *projects* to see your projects\n• Type *new project [name]* to create a project\n• Send a photo to upload a receipt\n• Type *help* for more options`;
+  }
+
   await sendWhatsAppMessage(phoneNumber, response);
 }
 
-// Get help text based on role
+// Get help text based on role - plain language
 function getHelpText(role) {
-  const common = `📱 Spend4Good WhatsApp Bot\n\nAvailable Commands:\n\n`;
-  
+  const header = `👋 Here's what you can do on Spend4Good:\n\n`;
+
   const commands = {
     admin: [
-      '• "Create project: [name]" - Create new project',
-      '• "Status" - Check pending approvals',
-      '• "Approve doc #[id]" - Approve document',
-      '• "Reject doc #[id]: [reason]" - Reject document',
-      '• Send image + "Receipt for [Project], R[amount]"'
+      `📋 *See pending approvals* — type "pending" or "what needs approval"`,
+      `✅ *Approve a receipt* — type "approve 1" (after seeing the pending list)`,
+      `❌ *Reject a receipt* — type "reject 1 reason here"`,
+      `📁 *See projects* — type "projects"`,
+      `➕ *Start a new project* — type "new project Well Drilling"`,
+      `🧾 *Upload a receipt* — send a photo and describe it`,
     ],
     project_manager: [
-      '• "Create project: [name]" - Create new project',
-      '• "Status" - Check pending approvals',
-      '• "Approve doc #[id]" - Approve document',
-      '• "Reject doc #[id]: [reason]" - Reject document',
-      '• Send image + "Receipt for [Project], R[amount]"'
+      `📋 *See pending approvals* — type "pending"`,
+      `✅ *Approve a receipt* — type "approve 1"`,
+      `❌ *Reject a receipt* — type "reject 1 reason here"`,
+      `📁 *See projects* — type "projects"`,
+      `➕ *Start a new project* — type "new project [name]"`,
+      `🧾 *Upload a receipt* — send a photo and describe it`,
     ],
     field_agent: [
-      '• Send image + "Receipt for [Project], R[amount]"',
-      '• "Status" - Check your pending approvals',
-      '• "Help" - Show this help'
+      `🧾 *Upload a receipt* — send a photo with a caption like "Petrol for site visit, R350"`,
+      `📋 *Check your receipts* — type "pending"`,
+      `📁 *See projects* — type "projects"`,
     ],
     accountant: [
-      '• "Status" - Check pending approvals',
-      '• "Report [Project]" - Generate project report',
-      '• "Help" - Show this help'
+      `📋 *See pending receipts* — type "pending"`,
+      `📁 *See projects* — type "projects"`,
     ],
     funder: [
-      '• "Status" - Check pending approvals',
-      '• "Report [Project]" - Generate project report',
-      '• "Help" - Show this help'
-    ]
+      `📋 *See pending receipts* — type "pending"`,
+      `📁 *See projects* — type "projects"`,
+    ],
   };
-  
-  return common + (commands[role] || commands.field_agent).join('\n');
+
+  const list = (commands[role] || commands.field_agent).join('\n\n');
+  return header + list + `\n\n_Just type naturally — I'll understand you!_`;
 }
 
 // ============================================
