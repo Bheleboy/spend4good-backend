@@ -10,19 +10,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Initialize Supabase with service role (bypasses RLS)
+// Trim keys to remove any accidental newlines/spaces from env var paste
 const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  process.env.SUPABASE_URL?.trim(),
+  process.env.SUPABASE_SERVICE_ROLE_KEY?.trim(),
   {
     auth: {
       autoRefreshToken: false,
       persistSession: false
-    },
-    db: {
-      schema: 'public'
-    },
-    global: {
-      headers: { 'x-supabase-bypass-rls': 'true' }
     }
   }
 );
