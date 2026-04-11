@@ -571,7 +571,7 @@ app.get('/api/documents', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '1.0.3', timestamp: new Date().toISOString() });
 });
 
 // Debug endpoint - checks env vars and Supabase connection
