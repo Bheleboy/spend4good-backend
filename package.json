@@ -8,10 +8,17 @@
     "dev": "nodemon server.js",
     "test": "jest"
   },
-  "keywords": ["nonprofit", "whatsapp", "twilio", "supabase", "spend-tracking"],
+  "keywords": [
+    "nonprofit",
+    "whatsapp",
+    "twilio",
+    "supabase",
+    "spend-tracking"
+  ],
   "author": "Ntando",
   "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.99.0",
     "@supabase/supabase-js": "^2.39.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
