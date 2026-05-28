@@ -330,7 +330,24 @@ IMPORTANT RULES:
 - The user picks by name or number — you map their choice to the correct project ID silently.
 - Never expose raw UUIDs or internal IDs to the user.`;
 
-  let messages = [...history];
+  // Sanitize messages - remove orphaned tool_result blocks
+  const sanitizedMessages = [];
+  for (let i = 0; i < history.length; i++) {
+    const msg = history[i];
+    if (Array.isArray(msg.content)) {
+      const hasToolResult = msg.content.some(b => b.type === 'tool_result');
+      if (hasToolResult) {
+        // Only include if previous message has matching tool_use
+        const prev = sanitizedMessages[sanitizedMessages.length - 1];
+        const prevHasToolUse = prev && Array.isArray(prev.content) &&
+          prev.content.some(b => b.type === 'tool_use');
+        if (!prevHasToolUse) continue; // skip orphaned tool_result
+      }
+    }
+    sanitizedMessages.push(msg);
+  }
+
+  let messages = sanitizedMessages;
 
   for (let iterations = 0; iterations < 10; iterations++) {
     const response = await anthropic.messages.create({
@@ -344,8 +361,7 @@ IMPORTANT RULES:
     if (response.stop_reason === 'end_turn') {
       const text = response.content.find(c => c.type === 'text');
       const reply = text ? text.text : 'Sorry, I could not generate a response.';
-      const finalHistory = [...messages, { role: 'assistant', content: response.content }];
-      await saveHistory(userPhone, finalHistory.slice(-20));
+      await saveHistory(userPhone, []);
       return reply;
     }
 
