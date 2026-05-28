@@ -571,7 +571,7 @@ async function handleMessage(phoneNumber, message, mediaUrl, mediaContentType) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-app.post('/webhook', async (req, res) => {
+app.post(['/webhook', '/api/whatsapp/webhook'], async (req, res) => {
   const twiml   = new twilio.twiml.MessagingResponse();
   const {
     Body: userMessage,
