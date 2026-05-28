@@ -590,9 +590,12 @@ app.post(['/webhook', '/api/whatsapp/webhook'], async (req, res) => {
     const reply = await handleMessage(userPhone, userMessage, mediaUrl, mediaContentType);
     console.log(`[webhook] OUT to=${userPhone} reply="${String(reply).slice(0, 80)}..."`);
     twiml.message(reply);
-  } catch (err) {
-    console.error(`[webhook] ERROR from=${userPhone}:`, err);
-    twiml.message('Sorry, something went wrong. Please try again.');
+  } catch (error) {
+    console.error('WEBHOOK ERROR:', error.message);
+    console.error('WEBHOOK STACK:', error.stack);
+    const errTwiml = new twilio.twiml.MessagingResponse();
+    errTwiml.message('Sorry, something went wrong. Please try again.');
+    return res.type('text/xml').send(errTwiml.toString());
   }
   res.type('text/xml').send(twiml.toString());
 });
